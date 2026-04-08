@@ -6,16 +6,18 @@ from models.strategy_params import StrategyParams
 from models.coin_health import CoinHealth
 from utils.db import Session
 import json
+import logging
+
+logger = logging.getLogger(__name__)
 
 class RiskManager:
     def __init__(self, key_id: int, user_id: int, online_learner=None):
         self.key_id = key_id
         self.user_id = user_id
-        self.online_learner = online_learner  # 可选，用于实时学习
+        self.online_learner = online_learner
         self.health_cache: Dict[str, float] = {}
         self._load_all_health()
 
-        # 动态参数缓存（全局 + 币种级）
         self.global_params: Dict[str, Any] = {}
         self.symbol_params: Dict[str, Dict[str, Any]] = {}
         self._load_all_params()
@@ -32,13 +34,11 @@ class RiskManager:
     def _load_all_params(self):
         session = Session()
         try:
-            # 加载全局参数（优先 user_id 级别，兼容 key_id）
             global_records = session.query(StrategyParams).filter(
                 StrategyParams.user_id == self.user_id,
                 StrategyParams.symbol.is_(None)
             ).all()
             if not global_records:
-                # 兼容旧数据：尝试从 key_id 加载
                 global_records = session.query(StrategyParams).filter(
                     StrategyParams.key_id == self.key_id,
                     StrategyParams.symbol.is_(None)
@@ -46,7 +46,6 @@ class RiskManager:
             for p in global_records:
                 self.global_params[p.param_name] = self._parse_param_value(p.param_value)
 
-            # 加载币种参数（优先 user_id，兼容 key_id）
             symbol_records = session.query(StrategyParams).filter(
                 StrategyParams.user_id == self.user_id,
                 StrategyParams.symbol.isnot(None)
@@ -64,7 +63,6 @@ class RiskManager:
             session.close()
 
     def _parse_param_value(self, value: str) -> Any:
-        """尝试将字符串解析为 JSON，否则返回原值（转为 float 或原字符串）"""
         if value is None:
             return None
         try:
@@ -77,7 +75,6 @@ class RiskManager:
             return value
 
     def _serialize_param_value(self, value: Any) -> str:
-        """将参数值序列化为字符串（JSON 或直接转 str）"""
         if isinstance(value, (list, dict)):
             return json.dumps(value)
         elif isinstance(value, (int, float)):
@@ -85,7 +82,6 @@ class RiskManager:
         else:
             return str(value)
 
-    # ---------- 健康度相关 ----------
     def get_health_score(self, symbol: str) -> float:
         return self.health_cache.get(symbol, 60.0)
 
@@ -107,7 +103,6 @@ class RiskManager:
         finally:
             session.close()
 
-    # ---------- 动态参数获取 ----------
     def get_param(self, param_name: str, symbol: str = None, default: Any = None) -> Any:
         if symbol and symbol in self.symbol_params and param_name in self.symbol_params[symbol]:
             return self.symbol_params[symbol][param_name]
@@ -116,10 +111,8 @@ class RiskManager:
         return default
 
     def set_param(self, param_name: str, param_value: Any, symbol: str = None):
-        # 序列化参数值
         serialized = self._serialize_param_value(param_value)
         StrategyParamsDAO.set_param(self.user_id, param_name, serialized, symbol, key_id=self.key_id)
-        # 更新缓存
         parsed = self._parse_param_value(serialized)
         if symbol is None:
             self.global_params[param_name] = parsed
@@ -127,8 +120,8 @@ class RiskManager:
             if symbol not in self.symbol_params:
                 self.symbol_params[symbol] = {}
             self.symbol_params[symbol][param_name] = parsed
+        logger.info(f"参数已更新: {param_name} for {symbol or 'global'} = {parsed}")
 
-    # ---------- 动态阈值/仓位计算（使用参数） ----------
     def get_position_ratio(self, symbol: str) -> float:
         base_ratio = self.get_param("position_ratio_base", symbol, 0.5)
         if isinstance(base_ratio, (list, dict)):

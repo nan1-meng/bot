@@ -10,6 +10,7 @@ class SymbolConfigDAO:
     def get_by_api_key(api_key_id):
         session = Session()
         try:
+            # 只返回 is_active=True 的记录
             return session.query(SymbolConfig).filter_by(api_key_id=api_key_id, is_active=True).all()
         finally:
             session.close()

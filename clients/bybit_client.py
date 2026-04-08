@@ -2,6 +2,9 @@
 from pybit.unified_trading import HTTP
 from .base_client import BaseClient
 import time
+import logging
+
+logger = logging.getLogger(__name__)
 
 class BybitClient(BaseClient):
     def __init__(self, api_key, api_secret, testnet=False, timeout=10):
@@ -66,40 +69,54 @@ class BybitClient(BaseClient):
         resp = self.session.get_wallet_balance(accountType='UNIFIED')
         coins = []
         for c in resp['result']['list'][0]['coin']:
-            coin_name = c['coin']
-            available = c.get('availableToWithdraw', '0')
-            if available == '':
-                available = c.get('walletBalance', '0')
+            coin_name = c['coin'].upper()  # 统一转为大写
             wallet_balance = c.get('walletBalance', '0')
             if wallet_balance == '':
                 wallet_balance = '0'
             coins.append({
                 'coin': coin_name,
-                'availableToWithdraw': available,
+                'availableToWithdraw': wallet_balance,
                 'walletBalance': wallet_balance,
             })
         return coins
 
-    def get_order_history(self, symbol: str, limit: int = 100, startTime: int = None) -> list:
+    def get_order_history(self, symbol: str, limit: int = 200, startTime: int = None) -> list:
         if startTime is None:
             startTime = int((time.time() - 90 * 24 * 3600) * 1000)
-        resp = self.session.get_order_history(
-            category="spot",
-            symbol=symbol,
-            limit=limit,
-            startTime=startTime
-        )
-        if resp['retCode'] != 0:
-            raise Exception(f"获取历史订单失败: {resp['retMsg']}")
-        orders = []
-        for item in resp['result']['list']:
-            if item['side'] == 'Buy' and item['orderStatus'] == 'Filled':
-                orders.append({
-                    'price': float(item['price']),
-                    'qty': float(item['qty']),
-                    'cumExecQty': float(item['cumExecQty']),
-                    'cumExecValue': float(item['cumExecValue']),
-                    'orderId': item['orderId'],
-                    'side': item['side']
-                })
-        return orders
+        all_orders = []
+        cursor = None
+        while True:
+            try:
+                params = {
+                    "category": "spot",
+                    "symbol": symbol,
+                    "limit": min(limit, 200),
+                    "startTime": startTime
+                }
+                if cursor:
+                    params["cursor"] = cursor
+                resp = self.session.get_order_history(**params)
+                if resp['retCode'] != 0:
+                    logger.error(f"Bybit 获取历史订单失败: {resp['retMsg']}")
+                    break
+                orders = resp['result']['list']
+                if not orders:
+                    break
+                for order in orders:
+                    if order['orderStatus'] in ('Filled', 'PartiallyFilled'):
+                        all_orders.append({
+                            'orderId': order['orderId'],
+                            'side': order['side'],
+                            'price': float(order['price']),
+                            'cumExecQty': float(order['cumExecQty']),
+                            'cumExecValue': float(order['cumExecValue']),
+                            'timestamp': int(order['updatedTime']),
+                            'orderStatus': order['orderStatus'],
+                        })
+                cursor = resp['result'].get('nextPageCursor')
+                if not cursor or len(all_orders) >= limit:
+                    break
+            except Exception as e:
+                logger.error(f"Bybit 获取历史订单异常: {e}")
+                break
+        return all_orders[:limit]

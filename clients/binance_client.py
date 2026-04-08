@@ -3,6 +3,9 @@ from binance.client import Client
 from binance.exceptions import BinanceAPIException
 from typing import List, Tuple
 from .base_client import BaseClient
+import logging
+
+logger = logging.getLogger(__name__)
 
 class BinanceClient(BaseClient):
     def __init__(self, api_key: str, api_secret: str, testnet: bool = False, timeout: int = 10):
@@ -50,9 +53,10 @@ class BinanceClient(BaseClient):
 
     def market_buy(self, symbol: str, amount_usdt: float) -> str:
         try:
+            amount_formatted = round(amount_usdt, 2)
             order = self.client.order_market_buy(
                 symbol=symbol,
-                quoteOrderQty=amount_usdt
+                quoteOrderQty=amount_formatted
             )
             return str(order['orderId'])
         except BinanceAPIException as e:
@@ -79,6 +83,29 @@ class BinanceClient(BaseClient):
             balances.append({
                 'coin': coin,
                 'availableToWithdraw': str(free),
-                'walletBalance': str(total)
+                'walletBalance': str(total)   # 总余额
             })
         return balances
+
+    def get_order_history(self, symbol: str, limit: int = 500, startTime: int = None) -> list:
+        all_orders = []
+        page_size = min(limit, 500)
+        # Binance 需要分页，通过递归或循环获取
+        # 简化：一次获取所有，但限制最多 1000 条
+        try:
+            orders = self.client.get_all_orders(symbol=symbol, limit=page_size)
+            for order in orders:
+                if order['status'] == 'FILLED':
+                    all_orders.append({
+                        'orderId': order['orderId'],
+                        'side': order['side'],  # 'BUY' or 'SELL'
+                        'price': float(order['price']),
+                        'cumExecQty': float(order['executedQty']),
+                        'cumExecValue': float(order['cummulativeQuoteQty']),
+                        'timestamp': order['time'],
+                        'orderStatus': order['status']
+                    })
+            return all_orders[:limit]
+        except Exception as e:
+            logger.error(f"Binance 获取历史订单异常: {e}")
+            return []

@@ -14,10 +14,10 @@ class TradeHistoryWindow:
         self.log_callback = log_callback
         self.root = tk.Toplevel()
         self.root.title("交易记录")
-        self.root.geometry("1000x650")
+        self.root.geometry("1200x650")
 
         self.current_displayed_ids = []
-        self.trade_cache = {}  # 缓存交易对象，用于右键查看K线
+        self.trade_cache = {}
         self.create_widgets()
         self.load_filters()
         self.load_data()
@@ -32,7 +32,7 @@ class TradeHistoryWindow:
 
         ttk.Label(row0, text="Key:").pack(side=tk.LEFT, padx=5)
         self.key_var = tk.StringVar(value="全部")
-        self.key_combo = ttk.Combobox(row0, textvariable=self.key_var, width=20, state="readonly")
+        self.key_combo = ttk.Combobox(row0, textvariable=self.key_var, width=25, state="readonly")
         self.key_combo.pack(side=tk.LEFT, padx=5)
 
         ttk.Label(row0, text="模式:").pack(side=tk.LEFT, padx=5)
@@ -73,7 +73,6 @@ class TradeHistoryWindow:
         table_frame = ttk.Frame(self.root)
         table_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
-        # 操作栏：全选、反选、删除选中、导出CSV
         action_frame = ttk.Frame(table_frame)
         action_frame.pack(fill=tk.X, pady=2)
         self.select_all_var = tk.BooleanVar()
@@ -83,15 +82,16 @@ class TradeHistoryWindow:
         ttk.Button(action_frame, text="导出 CSV", command=self.export_csv).pack(side=tk.LEFT, padx=5)
         ttk.Button(action_frame, text="刷新", command=self.load_data).pack(side=tk.LEFT, padx=5)
 
-        # 表格列
-        columns = ("ID", "时间", "平台", "币种", "方向", "价格", "数量", "成交额(USDT)", "手续费", "盈亏(USDT)", "订单号")
+        # 列定义：增加平台和Key名，调整顺序
+        columns = ("ID", "交易时间", "平台", "Key名", "币种", "方向", "价格", "数量", "成交额(USDT)", "手续费", "盈亏(USDT)", "订单号")
         self.tree = ttk.Treeview(table_frame, columns=columns, show="headings", height=20, selectmode="extended")
         for col in columns:
             self.tree.heading(col, text=col)
             self.tree.column(col, width=100, anchor=tk.CENTER)
         self.tree.column("ID", width=50)
-        self.tree.column("时间", width=150)
+        self.tree.column("交易时间", width=150)
         self.tree.column("平台", width=80)
+        self.tree.column("Key名", width=100)
         self.tree.column("币种", width=80)
         self.tree.column("方向", width=60)
         self.tree.column("价格", width=100)
@@ -102,33 +102,27 @@ class TradeHistoryWindow:
         self.tree.column("订单号", width=150)
         self.tree.pack(fill=tk.BOTH, expand=True)
         self.tree.bind("<<TreeviewSelect>>", self.on_tree_select)
-        self.tree.bind("<Button-3>", self.on_right_click)  # 右键菜单
+        self.tree.bind("<Button-3>", self.on_right_click)
 
-        # 右键菜单
         self.right_click_menu = tk.Menu(self.root, tearoff=0)
         self.right_click_menu.add_command(label="查看买入K线", command=self.view_entry_kline)
         self.right_click_menu.add_command(label="查看卖出K线", command=self.view_exit_kline)
 
-        # 状态栏
         self.status_var = tk.StringVar()
         status_bar = ttk.Label(self.root, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W)
         status_bar.pack(fill=tk.X, side=tk.BOTTOM, padx=5, pady=2)
 
     def on_right_click(self, event):
-        """右键点击表格时弹出菜单"""
         item = self.tree.identify_row(event.y)
         if item:
             self.tree.selection_set(item)
-            # 获取选中行的交易ID
             selected = self.tree.selection()
             if selected:
                 values = self.tree.item(selected[0], "values")
                 if values:
                     trade_id = int(values[0])
-                    # 从缓存中获取交易对象
                     trade = self.trade_cache.get(trade_id)
                     if trade:
-                        # 根据是否有K线数据启用菜单项
                         if trade.entry_kline:
                             self.right_click_menu.entryconfig("查看买入K线", state=tk.NORMAL)
                         else:
@@ -140,7 +134,6 @@ class TradeHistoryWindow:
                         self.right_click_menu.post(event.x_root, event.y_root)
 
     def view_entry_kline(self):
-        """查看买入K线快照"""
         selected = self.tree.selection()
         if not selected:
             return
@@ -153,7 +146,6 @@ class TradeHistoryWindow:
             self._show_kline(trade.entry_kline, f"买入快照 - {trade.symbol} @ {trade.price:.6f}")
 
     def view_exit_kline(self):
-        """查看卖出K线快照"""
         selected = self.tree.selection()
         if not selected:
             return
@@ -166,43 +158,34 @@ class TradeHistoryWindow:
             self._show_kline(trade.exit_kline, f"卖出快照 - {trade.symbol} @ {trade.price:.6f}")
 
     def _show_kline(self, kline_data, title):
-        """显示K线图窗口（支持中文字体）"""
         try:
             import matplotlib
             matplotlib.use('TkAgg')
             import matplotlib.pyplot as plt
             from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-            # 设置中文字体
             plt.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei', 'Arial Unicode MS']
             plt.rcParams['axes.unicode_minus'] = False
         except ImportError:
             messagebox.showerror("错误", "请安装 matplotlib 库: pip install matplotlib")
             return
 
-        # 解析K线数据
         prices = kline_data.get('prices', [])
         highs = kline_data.get('highs', [])
         lows = kline_data.get('lows', [])
         volumes = kline_data.get('volumes', [])
-        timestamp = kline_data.get('timestamp', 0)
-
         if not prices:
             messagebox.showinfo("提示", "没有K线数据")
             return
 
-        # 创建新窗口
         win = tk.Toplevel(self.root)
         win.title(title)
         win.geometry("800x500")
 
-        # 创建图形
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8, 5), sharex=True, gridspec_kw={'height_ratios': [3, 1]})
         fig.subplots_adjust(hspace=0)
 
-        # 绘制K线（简化版：用折线图代替）
         ax1.plot(prices, color='black', linewidth=1, label='收盘价')
         ax1.fill_between(range(len(prices)), prices, alpha=0.3, color='blue')
-        # 绘制高低点范围
         if highs and lows:
             for i in range(len(prices)):
                 ax1.plot([i, i], [lows[i], highs[i]], color='gray', linewidth=0.5)
@@ -212,23 +195,19 @@ class TradeHistoryWindow:
         ax1.legend()
         ax1.grid(True, alpha=0.3)
 
-        # 成交量柱状图
         if volumes:
             ax2.bar(range(len(volumes)), volumes, color='gray', alpha=0.5)
             ax2.set_ylabel("成交量")
         ax2.set_xlabel("K线序号 (最新在右侧)")
         ax2.grid(True, alpha=0.3)
 
-        # 将matplotlib图形嵌入Tkinter
         canvas = FigureCanvasTkAgg(fig, master=win)
         canvas.draw()
         canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
-        # 关闭窗口时销毁图形对象，避免内存泄漏
         def on_close():
             plt.close(fig)
             win.destroy()
-
         win.protocol("WM_DELETE_WINDOW", on_close)
 
     def load_filters(self):
@@ -237,7 +216,7 @@ class TradeHistoryWindow:
         for key_id in keys:
             key = self.key_service.get_key(key_id)
             if key:
-                key_options.append(f"{key_id}: {key.get('platform', 'bybit').upper()}")
+                key_options.append(f"{key_id}: {key.get('platform', '').upper()} - {key.get('key_name', '')}")
         self.key_combo["values"] = key_options
         self.key_combo.current(0)
 
@@ -330,15 +309,15 @@ class TradeHistoryWindow:
                 continue
             if side != "全部" and t.side != side:
                 continue
-            if start_dt and t.timestamp < start_dt:
+            if start_dt and t.executed_at < start_dt:
                 continue
-            if end_dt and t.timestamp > end_dt:
+            if end_dt and t.executed_at > end_dt:
                 continue
             filtered.append(t)
 
-        filtered.sort(key=lambda x: x.timestamp)
+        filtered.sort(key=lambda x: x.executed_at)
 
-        # 计算盈亏（FIFO）
+        # FIFO 盈亏计算
         buy_queues = {}
         for t in filtered:
             symbol = t.symbol
@@ -379,11 +358,15 @@ class TradeHistoryWindow:
             if pnl is None:
                 pnl = 0.0
             total_pnl += pnl
-            time_str = t.timestamp.strftime("%Y-%m-%d %H:%M:%S")
+            time_str = t.executed_at.strftime("%Y-%m-%d %H:%M:%S")
+            platform = t.platform or "-"
+            key_name = t.key_name or "-"
             order_id_str = str(t.order_id) if t.order_id else ""
             item_id = self.tree.insert("", tk.END, values=(
                 t.id,
                 time_str,
+                platform,
+                key_name,
                 t.symbol,
                 "买入" if t.side == "buy" else "卖出",
                 f"{t.price:.6f}",
@@ -394,7 +377,7 @@ class TradeHistoryWindow:
                 order_id_str
             ))
             self.current_displayed_ids.append((item_id, t.id))
-            self.trade_cache[t.id] = t  # 缓存交易对象
+            self.trade_cache[t.id] = t
 
         self.status_var.set(f"共 {len(filtered)} 条记录，合计盈亏: {total_pnl:.2f} USDT")
         self.select_all_var.set(False)
@@ -464,8 +447,9 @@ class TradeHistoryWindow:
                 writer.writerow(columns)
                 for item in items:
                     values = list(self.tree.item(item, "values"))
-                    if len(values) > 9 and values[9]:
-                        values[9] = f'="{values[9]}"'
+                    # 订单号列（最后一列）加引号防止科学计数法
+                    if values and len(values) > 11:
+                        values[11] = f'="{values[11]}"'
                     writer.writerow(values)
             messagebox.showinfo("成功", f"已导出 {len(items)} 条记录到\n{filename}")
             if self.log_callback:

@@ -275,36 +275,72 @@ class MainWindow:
         if not raw:
             self.log("请输入币种")
             return
-        symbol = self.symbol_list._normalize_symbol(raw)
+
+        symbol = raw.upper().replace('/', '')
+
+        # 重新加载配置，确保内存最新
+        self.key_service.reload_symbols(self.selected_key_id)
+        key = self.key_service.get_key(self.selected_key_id)
+        if not key:
+            self.log("Key 不存在")
+            return
+
+        # 检查内存中是否已有
+        if symbol in key['symbols']:
+            self.log(f"{symbol} 已存在，刷新显示")
+            self.key_service.update_assets(self.selected_key_id, force=True)
+            self.symbol_list.refresh()
+            return
+
         try:
             config = self.config_panel.get_strategy_config()
         except ValueError as e:
             self.log(f"参数错误: {e}")
             return
-        key = self.key_service.get_key(self.selected_key_id)
-        if symbol in key['symbols']:
-            self.log(f"{symbol} 已存在")
-            return
+
         from models.symbol_config import SymbolConfig
         from utils.db import Session
         session = Session()
         try:
-            new_config = SymbolConfig(
+            existing = session.query(SymbolConfig).filter_by(
                 user_id=self.user.id,
                 api_key_id=self.selected_key_id,
                 platform=key['platform'],
-                symbol=symbol,
-                category='spot',
-                mode='default',
-                config_json=config,
-                is_active=True
-            )
-            session.add(new_config)
-            session.commit()
-            config['db_id'] = new_config.id
-            key['symbols'][symbol] = config
+                symbol=symbol
+            ).first()
+            if existing:
+                # 如果存在但可能 is_active=False，则重新激活
+                if not existing.is_active:
+                    existing.is_active = True
+                    existing.config_json = config
+                    session.commit()
+                    self.log(f"{symbol} 配置已重新激活")
+                else:
+                    self.log(f"{symbol} 已存在（数据库中）")
+                # 重新加载配置到内存
+                self.key_service.reload_symbols(self.selected_key_id)
+            else:
+                new_config = SymbolConfig(
+                    user_id=self.user.id,
+                    api_key_id=self.selected_key_id,
+                    platform=key['platform'],
+                    symbol=symbol,
+                    category='spot',
+                    mode='default',
+                    config_json=config,
+                    is_active=True
+                )
+                session.add(new_config)
+                session.flush()
+                config['db_id'] = new_config.id
+                session.commit()
+                # 添加到内存
+                key['symbols'][symbol] = config
+                self.log(f"已添加 {symbol}")
+
+            # 强制更新资产并刷新
+            self.key_service.update_assets(self.selected_key_id, force=True)
             self.symbol_list.refresh()
-            self.log(f"已添加 {symbol}")
         except Exception as e:
             session.rollback()
             self.log(f"添加失败: {e}")

@@ -20,7 +20,7 @@ class TradeDAO:
     def get_by_user(user_id, limit=100):
         session = Session()
         try:
-            return session.query(Trade).filter_by(user_id=user_id).order_by(Trade.timestamp.desc()).limit(limit).all()
+            return session.query(Trade).filter_by(user_id=user_id).order_by(Trade.executed_at.desc()).limit(limit).all()
         finally:
             session.close()
 

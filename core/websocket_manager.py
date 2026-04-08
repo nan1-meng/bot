@@ -23,6 +23,7 @@ class WebSocketManager:
         self._stop = threading.Event()
         self._reconnect_delay = 5
         self._max_reconnect_delay = 60
+        self._reconnect_attempts = 0
 
     def start(self):
         if self.running:
@@ -79,7 +80,7 @@ class WebSocketManager:
                 msg = {"method": "SUBSCRIBE", "params": [stream], "id": 1}
                 self.ws.send(json.dumps(msg))
         except Exception as e:
-            logger.error(f"发送订阅失败 {symbol}/{channel}: {e}")
+            logger.debug(f"发送订阅失败 {symbol}/{channel}: {e}")
 
     def _run(self):
         url = self._get_url()
@@ -93,12 +94,15 @@ class WebSocketManager:
                                                  on_close=self._on_close)
                 self.ws.run_forever(ping_interval=30, ping_timeout=10)
             except Exception as e:
-                logger.error(f"WebSocket 连接异常: {e}")
+                logger.debug(f"WebSocket 连接异常: {e}")
             if not self.running or self._stop.is_set():
                 break
-            logger.info(f"WebSocket 断开，{delay}秒后重连...")
+            # 指数退避，避免频繁重连
+            logger.debug(f"WebSocket 断开，{delay}秒后重连...")
             time.sleep(delay)
             delay = min(delay * 2, self._max_reconnect_delay)
+            self._reconnect_attempts += 1
+        self._reconnect_attempts = 0
 
     def _get_url(self):
         if self.platform == 'bybit':
@@ -111,6 +115,7 @@ class WebSocketManager:
     def _on_open(self, ws):
         logger.info(f"WebSocket connected for {self.platform}")
         self._connected = True
+        self._reconnect_attempts = 0
         # 发送所有待订阅请求
         for symbol, channel, interval in self._pending_subscriptions:
             if channel == 'kline':
@@ -134,7 +139,7 @@ class WebSocketManager:
             else:
                 self._handle_binance_message(data)
         except Exception as e:
-            logger.error(f"WebSocket message error: {e}")
+            logger.debug(f"WebSocket message error: {e}")
 
     def _handle_bybit_message(self, data):
         if 'topic' in data:
@@ -171,7 +176,8 @@ class WebSocketManager:
                         self.subscriptions[symbol]['trade'](trade)
 
     def _on_error(self, ws, error):
-        logger.warning(f"WebSocket error: {error}")
+        # 降低错误日志级别，避免刷屏
+        logger.debug(f"WebSocket error: {error}")
 
     def _on_close(self, ws, close_status_code, close_msg):
         logger.info(f"WebSocket closed (code: {close_status_code})")
