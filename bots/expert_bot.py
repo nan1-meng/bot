@@ -1,4 +1,8 @@
-# 文件路径: bots/expert_bot.py
+# ============================================================
+# 文件: bots/expert_bot.py
+# 说明: AI专家模式机器人，集成多策略切换和机器学习预测
+# ============================================================
+
 import time
 import math
 from collections import deque
@@ -16,6 +20,9 @@ from core.timeframe_analyzer import TimeframeAnalyzer
 from core.market_analyzer import MarketAnalyzer
 from core.market_data_cache import MarketDataCache
 from strategies.expert_rules import ExpertRules
+from core.market_classifier import MarketClassifier
+from strategies.strategy_switcher import StrategySwitcher
+from core.ml_predictor import MLPredictor
 
 
 class ExpertBot(BaseBot):
@@ -23,7 +30,7 @@ class ExpertBot(BaseBot):
                  mode_display="", callback=None, risk_manager=None):
         super().__init__(platform, api_key, secret_key, symbol, config, user_id, key_id,
                          mode_display, callback, auto_warmup=True, risk_manager=risk_manager)
-        self.key_service = key_service  # 保存 key_service 以获取 key_name
+        self.key_service = key_service
         self.indicators = Indicators()
         self.signal_engine = SignalEngine()
         self.exit_strategy = ExitStrategy()
@@ -31,6 +38,14 @@ class ExpertBot(BaseBot):
         self.timeframe_analyzer = TimeframeAnalyzer()
         self.market_analyzer = MarketAnalyzer(lookback=50)
         self.expert_rules = ExpertRules()
+
+        # 新增：市场分类器和策略切换器
+        self.market_classifier = MarketClassifier()
+        self.strategy_switcher = StrategySwitcher(config.get("strategy_switcher", {}))
+
+        # 新增：机器学习预测器
+        self.ml_predictor = MLPredictor(model_path=f"ml_models/{symbol}_{key_id}.pkl")
+        self.ml_enabled = config.get("ml_enabled", True)
 
         self.kline_prices = deque(maxlen=500)
         self.kline_highs = deque(maxlen=500)
@@ -40,7 +55,7 @@ class ExpertBot(BaseBot):
 
         self.tf_klines = {'60': None, '240': None, 'D': None}
         self.tf_last_update = 0
-
+        self._add_fail_until = 0
         self.last_status_log = 0
         self.last_heartbeat = 0
         self.session_id = None
@@ -72,10 +87,23 @@ class ExpertBot(BaseBot):
         self.last_action = "hold"
 
         self.loop_interval = 2.0
+
+        # 新增：卖出失败冷却
+        self._sell_fail_until = 0
+        self._sell_fail_count = 0
+        self.MAX_SELL_FAIL = 3
+        self.SELL_FAIL_COOLDOWN = 300
+
         self._warmup_kline()
 
+        # 训练ML模型（如果历史数据足够）
+        if self.ml_enabled:
+            try:
+                self.ml_predictor.train_from_history(self.symbol, self.key_id)
+            except Exception as e:
+                self._log("系统", f"ML模型训练失败: {e}")
+
     def _get_key_name(self) -> str:
-        """获取当前Key的名称"""
         if self.key_service:
             key = self.key_service.get_key(self.key_id)
             if key:
@@ -123,21 +151,46 @@ class ExpertBot(BaseBot):
             )
 
     def _calculate_buy_score(self) -> float:
+        """计算综合买入评分（融合技术指标、专家规则和ML预测）"""
         if len(self.kline_prices) < 50:
             return 0.0
+
         current_price = self.get_current_price()
         if current_price is None:
             current_price = self.kline_prices[-1] if self.kline_prices else 0
+
         highs = list(self.kline_highs)
         lows = list(self.kline_lows)
         volumes = list(self.volumes)
         prices = list(self.kline_prices)
+
+        # 1. 技术指标评分
         range_score = self.signal_engine.realtime_range_score(highs, lows, current_price, period=20, volumes=volumes)
+
+        # 2. 专家规则评分
         cache = MarketDataCache()
         features = cache.get_features(self.symbol)
         expert_score = self.expert_rules.evaluate(prices, highs, lows, current_price, features)
         expert_factor = 50 + expert_score * 50
-        final_score = range_score * 0.6 + expert_factor * 0.4
+
+        # 3. 机器学习预测概率
+        ml_factor = 50.0
+        if self.ml_enabled:
+            ml_features = self.ml_predictor.extract_features(prices, volumes, highs, lows)
+            if ml_features is not None:
+                up_prob, down_prob = self.ml_predictor.predict(ml_features)
+                ml_factor = up_prob * 100  # 上涨概率0~1转为0~100
+
+        # 4. 根据市场状态调整权重
+        market_state = self.strategy_switcher.current_state
+        if market_state == "trending":
+            weights = (0.3, 0.3, 0.4)  # ML权重更高
+        elif market_state == "ranging":
+            weights = (0.5, 0.3, 0.2)  # 技术指标权重更高
+        else:
+            weights = (0.4, 0.3, 0.3)
+
+        final_score = (range_score * weights[0] + expert_factor * weights[1] + ml_factor * weights[2])
         return final_score
 
     def _get_dynamic_buy_threshold(self) -> float:
@@ -145,22 +198,33 @@ class ExpertBot(BaseBot):
         health = self.risk_manager.get_health_score(self.symbol)
         adjustment = (60 - health) * 0.5
         threshold = base_threshold + adjustment
+
         higher_trend = self.timeframe_analyzer.get_higher_trend(self.symbol)
         if higher_trend == 'bear':
             threshold += 10
         elif higher_trend == 'bull':
             threshold -= 5
-        market_state = self.market_analyzer.get_state()
-        volatility = market_state.get('volatility_ratio', 0.01)
+
+        # 市场状态调整阈值
+        market_state = self.strategy_switcher.current_state
+        if market_state == "trending":
+            threshold -= 5   # 趋势市场更容易买入
+        elif market_state == "ranging":
+            threshold += 5   # 震荡市场更谨慎
+
+        market_state_info = self.market_analyzer.get_state()
+        volatility = market_state_info.get('volatility_ratio', 0.01)
         if volatility > 0.03:
             threshold += 10
         elif volatility < 0.01:
             threshold -= 5
-        volume_state = market_state.get('volume', 'normal')
+
+        volume_state = market_state_info.get('volume', 'normal')
         if volume_state == 'high':
             threshold += 5
         elif volume_state == 'low':
             threshold -= 5
+
         return max(20, min(80, threshold))
 
     def _calculate_atr(self) -> float:
@@ -207,16 +271,14 @@ class ExpertBot(BaseBot):
         self.last_action = action
         self.last_action_reason = reason
 
-    # ========== 买入逻辑 ==========
+    # ========== 买入逻辑（融合策略切换） ==========
     def _should_buy(self, usdt_balance: float, price: float) -> bool:
         if self.buy_disabled:
             self._set_action("hold", "买入永久禁用")
             return False
-
         if self.buy_blocked_until > time.time():
             self._set_action("hold", "连续亏损触发买入冻结")
             return False
-
         if self._in_trade_cooldown():
             self._set_action("hold", "交易失败冷却中")
             return False
@@ -231,29 +293,62 @@ class ExpertBot(BaseBot):
             self._set_action("hold", "大周期空头，禁止买入")
             return False
 
-        score = self._calculate_buy_score()
-        threshold = self._get_dynamic_buy_threshold()
-        if score + 1e-6 < threshold:
-            self._set_action("hold", f"买入评分不足 score={score:.1f} < threshold={threshold:.1f}")
-            return False
+        # 使用策略切换器获取买入信号
+        data = {
+            "current_price": price,
+            "usdt_balance": usdt_balance,
+            "prices": list(self.kline_prices),
+            "volumes": list(self.volumes),
+            "highs": list(self.kline_highs),
+            "lows": list(self.kline_lows)
+        }
+        should_buy_strategy, suggested_ratio = self.strategy_switcher.get_buy_signal(data)
 
-        if usdt_balance < self.min_order_value:
-            self._set_action("hold", f"USDT余额不足 {usdt_balance:.2f} < {self.min_order_value:.2f}")
-            return False
+        if should_buy_strategy:
+            # 计算最终评分作为辅助验证
+            score = self._calculate_buy_score()
+            threshold = self._get_dynamic_buy_threshold()
+            if score + 1e-6 < threshold:
+                self._set_action("hold", f"买入评分不足 score={score:.1f} < threshold={threshold:.1f}")
+                return False
 
-        self._set_action("buy", f"买入条件满足 score={score:.1f} >= threshold={threshold:.1f}")
-        return True
+            if usdt_balance < self.min_order_value:
+                self._set_action("hold", f"USDT余额不足 {usdt_balance:.2f} < {self.min_order_value:.2f}")
+                return False
+
+            self._set_action("buy", f"策略信号买入, 市场状态={self.strategy_switcher.current_state}, 建议仓位={suggested_ratio:.2f}")
+            return True
+
+        self._set_action("hold", "策略信号不满足买入条件")
+        return False
 
     def _calculate_buy_amount(self, usdt_balance: float, price: float) -> float:
+        # 获取策略建议的仓位比例
+        data = {
+            "current_price": price,
+            "usdt_balance": usdt_balance,
+            "prices": list(self.kline_prices),
+            "volumes": list(self.volumes),
+            "highs": list(self.kline_highs),
+            "lows": list(self.kline_lows)
+        }
+        _, suggested_ratio = self.strategy_switcher.get_buy_signal(data)
+
         health = self.risk_manager.get_health_score(self.symbol)
         position_ratio = self.risk_manager.get_position_ratio(self.symbol)
-        base_amount = usdt_balance * 0.5 * position_ratio
+
+        # 结合策略建议和健康度
+        final_ratio = min(suggested_ratio, position_ratio)
+        base_amount = usdt_balance * final_ratio
+
         if self.max_buy_amount is not None:
             base_amount = min(base_amount, self.max_buy_amount)
+
         atr = self._calculate_atr()
         if atr > 0 and price > 0:
             vol_factor = min(1.0, atr / price * 5)
             base_amount = base_amount * (1 - vol_factor * 0.5)
+
         buy_amount = max(self.min_order_value, base_amount)
         buy_amount = min(buy_amount, usdt_balance)
         return buy_amount
@@ -335,8 +430,16 @@ class ExpertBot(BaseBot):
                 amount_usdt=buy_amount,
                 fee=buy_fee,
                 order_id=order_id,
-                market_state=self.market_analyzer.get_state_string()
+                market_state=self.market_analyzer.get_state_string(),
+                is_manual=False
             )
+
+            # 通知策略切换器
+            self.strategy_switcher.update_after_trade({
+                "side": "buy",
+                "price": price,
+                "quantity": actual_bought
+            })
 
             self._reset_trade_fail()
             if self.callback:
@@ -357,8 +460,11 @@ class ExpertBot(BaseBot):
                 self._record_trade_fail(str(e))
             return False
 
-    # ========== 补仓逻辑 ==========
-    def _should_add_position(self, price: float, atr: float) -> bool:
+    # ========== 补仓逻辑（保持不变，但增加策略判断） ==========
+    def _should_add_position(self, price: float, atr: float, usdt_balance: float) -> bool:
+        if time.time() < self._add_fail_until:
+            self._set_action("hold", "补仓失败冷却中")
+            return False
         if not self.position["has_position"]:
             self._set_action("hold", "无持仓，不补仓")
             return False
@@ -371,18 +477,29 @@ class ExpertBot(BaseBot):
         if not self.risk_manager.can_add_position(self.symbol):
             self._set_action("hold", "风险管理禁止补仓")
             return False
+
         avg_price = self.position["avg_price"]
         if avg_price == 0:
             self._set_action("hold", "成本价为0，不补仓")
             return False
+
         market_trend = self.timeframe_analyzer.get_higher_trend(self.symbol)
         if market_trend == 'bear':
             self._set_action("hold", "大周期空头，不补仓")
             return False
+
+        # 根据市场状态决定是否补仓
+        market_state = self.strategy_switcher.current_state
+        if market_state == "ranging":
+            # 震荡市场：网格策略的补仓由网格逻辑处理，此处不重复
+            self._set_action("hold", "震荡市场由网格策略管理，跳过常规补仓")
+            return False
+
         health = self.risk_manager.get_health_score(self.symbol)
         if health < 30:
             self._set_action("hold", f"健康度过低 {health:.1f}")
             return False
+
         loss_pct = (avg_price - price) / avg_price
         if loss_pct <= 0:
             self._set_action("hold", "当前非浮亏，不补仓")
@@ -391,10 +508,21 @@ class ExpertBot(BaseBot):
         if loss_pct < min_loss_pct:
             self._set_action("hold", f"浮亏不足 {loss_pct * 100:.2f}%")
             return False
+
         loss_atr = (avg_price - price) / atr if atr != 0 else 0
         if loss_atr >= 0.5 or loss_pct >= 0.03:
-            self._set_action("scale", f"补仓条件满足 loss_pct={loss_pct*100:.2f}%, loss_atr={loss_atr:.2f}")
+            initial_qty = self.position["qty"]
+            ratios = self.risk_manager.get_param("add_position_ratios", self.symbol, [0.5, 0.3, 0.2])
+            add_qty = self.add_position_logic.calculate_add_qty(initial_qty, self.add_count, ratios)
+            if add_qty > 0:
+                est_amount = add_qty * price
+                if est_amount > usdt_balance:
+                    self._set_action("hold", f"USDT余额不足补仓 {est_amount:.2f} > {usdt_balance:.2f}")
+                    self._add_fail_until = time.time() + 60
+                    return False
+            self._set_action("scale", f"补仓条件满足 loss_pct={loss_pct * 100:.2f}%, loss_atr={loss_atr:.2f}")
             return True
+
         self._set_action("hold", "补仓条件未满足")
         return False
 
@@ -416,11 +544,13 @@ class ExpertBot(BaseBot):
             add_amount = min(add_amount, self.max_add_amount)
         if add_amount > usdt_balance:
             self._set_action("hold", f"USDT余额不足补仓 {add_amount:.2f} > {usdt_balance:.2f}")
+            self._add_fail_until = time.time() + 60
             return False
         try:
             order_id = self.market_buy(add_amount)
             if order_id is None:
                 self._record_trade_fail("补仓下单返回空order_id")
+                self._add_fail_until = time.time() + 60
                 return False
             time.sleep(2)
             new_balances = self.get_balances()
@@ -428,10 +558,12 @@ class ExpertBot(BaseBot):
             old_qty = self.position["qty"]
             if new_base <= old_qty:
                 self._record_trade_fail("补仓后持仓未增加")
+                self._add_fail_until = time.time() + 60
                 return False
             actual_added = new_base - old_qty
             if actual_added <= 0:
                 self._record_trade_fail("补仓实际成交数量<=0")
+                self._add_fail_until = time.time() + 60
                 return False
             add_fee = add_amount * self.slippage
             total_cost = add_amount + add_fee
@@ -464,7 +596,8 @@ class ExpertBot(BaseBot):
                 amount_usdt=add_amount,
                 fee=add_fee,
                 order_id=order_id,
-                market_state=self.market_analyzer.get_state_string()
+                market_state=self.market_analyzer.get_state_string(),
+                is_manual=False
             )
             self._reset_trade_fail()
             if self.callback:
@@ -476,34 +609,77 @@ class ExpertBot(BaseBot):
         except Exception as e:
             self._log("系统", f"{self.symbol} 补仓失败: {e}")
             self._record_trade_fail(str(e))
+            self._add_fail_until = time.time() + 60
             return False
 
-    # ========== 卖出逻辑 ==========
+    # ========== 卖出逻辑（融合策略切换） ==========
     def _should_sell(self, price: float, atr_price: float, rsi: float, volume_ratio: float,
-                     market_trend: str, hold_hours: float) -> Tuple[bool, List[Tuple[float, float]]]:
+                     market_trend: str, hold_hours: float, usdt_balance: float = None) -> Tuple[bool, List[Tuple[float, float]]]:
         if not self.position["has_position"]:
             self._set_action("hold", "无持仓，不卖出")
             return False, []
+
         avg_price = self.position["avg_price"]
         if avg_price == 0:
             self._set_action("hold", "成本价为0，不卖出")
             return False, []
+
         current_qty = self.position["qty"]
         position_value = current_qty * price
+
+        # 残仓处理
+        if usdt_balance is not None and usdt_balance < self.min_order_value and position_value >= self.min_order_value:
+            self._set_action("sell", f"USDT余额不足 {usdt_balance:.2f}，强制卖出全部持仓")
+            return True, [(current_qty, price)]
+
         if 0 < position_value < self.min_order_value:
             hold_seconds = time.time() - self.position.get("entry_time", time.time())
             if hold_seconds > 1800:
-                self._set_action("sell", f"残仓强制清仓（持有{hold_seconds/60:.0f}分钟）")
+                self._set_action("sell", f"残仓强制清仓（持有{hold_seconds / 60:.0f}分钟）")
                 return True, [(current_qty, price)]
             else:
                 self._set_action("hold", f"残仓观察 {position_value:.2f}U < {self.min_order_value:.2f}U")
                 return False, []
+
+        # 使用策略切换器获取卖出信号
+        data = {
+            "current_price": price,
+            "current_qty": current_qty,
+            "avg_price": avg_price,
+            "prices": list(self.kline_prices),
+            "volumes": list(self.volumes),
+            "highs": list(self.kline_highs),
+            "lows": list(self.kline_lows)
+        }
+        should_sell_strategy, suggested_ratio = self.strategy_switcher.get_sell_signal(data)
+
+        if should_sell_strategy:
+            # 计算卖出数量
+            sell_qty = current_qty * suggested_ratio
+            sell_qty = min(sell_qty, current_qty)
+
+            # 如果建议全部卖出，使用全仓
+            if suggested_ratio >= 0.99:
+                sell_orders = [(current_qty, price)]
+            else:
+                # 分仓卖出，基于exit_strategy
+                sell_orders = self.exit_strategy.calculate_sell_orders(
+                    current_qty, price, avg_price, atr_price, rsi, volume_ratio, market_trend, hold_hours
+                )
+                if not sell_orders:
+                    sell_orders = [(sell_qty, price)]
+
+            self._set_action("sell", f"策略信号卖出, 市场状态={self.strategy_switcher.current_state}, 建议比例={suggested_ratio:.2f}")
+            return True, sell_orders
+
+        # 原有退出策略作为后备
         sell_orders = self.exit_strategy.calculate_sell_orders(
             current_qty, price, avg_price, atr_price, rsi, volume_ratio, market_trend, hold_hours
         )
         if sell_orders:
             self._set_action("sell", f"卖出条件满足，计划单数={len(sell_orders)}")
             return True, sell_orders
+
         self._set_action("hold", "卖出条件未满足")
         return False, []
 
@@ -514,6 +690,10 @@ class ExpertBot(BaseBot):
         if self._in_trade_cooldown():
             self._set_action("hold", "交易失败冷却中，不卖出")
             return False
+        if time.time() < self._sell_fail_until:
+            self._set_action("hold", "卖出失败冷却中")
+            return False
+
         price = self.get_current_price()
         if price is None:
             self._set_action("hold", "当前价格为空，不卖出")
@@ -526,6 +706,7 @@ class ExpertBot(BaseBot):
             self._log("系统", f"{self.symbol} 无持仓，跳过卖出")
             self._set_action("hold", "无持仓，跳过卖出")
             return False
+
         total_qty = sum(qty for qty, _ in sell_orders)
         if total_qty <= 0:
             self._set_action("hold", "卖出计划数量<=0")
@@ -534,32 +715,38 @@ class ExpertBot(BaseBot):
         min_order = self.config.get("min_order_value", 5.0)
         planned_value = planned_qty * price
         full_value = current_qty * price
+
         if planned_value < min_order <= full_value:
             self._log("系统", f"{self.symbol} 计划卖出价值 {planned_value:.2f}U 小于最小额，改为整仓卖出")
             planned_qty = current_qty
             planned_value = full_value
+
         if planned_value < min_order:
             self._log("系统", f"{self.symbol} 卖出总价值 {planned_value:.2f} USDT 小于最小订单额 {min_order}，跳过卖出")
+            self._sell_fail_count += 1
+            if self._sell_fail_count >= self.MAX_SELL_FAIL:
+                self._sell_fail_until = time.time() + self.SELL_FAIL_COOLDOWN
+                self._log("系统", f"连续卖出失败{self.MAX_SELL_FAIL}次，进入冷却{self.SELL_FAIL_COOLDOWN}秒")
+                self._sell_fail_count = 0
             self._set_action("hold", f"卖出价值不足 {planned_value:.2f} < {min_order:.2f}")
             return False
+
         raw_qty = math.floor(planned_qty / self.step) * self.step
         if raw_qty <= 0:
             self._log("系统", f"{self.symbol} 计算出的可卖数量为0，跳过卖出")
             self._set_action("hold", "步长裁剪后卖出数量为0")
             return False
-        if raw_qty * price < min_order:
-            raw_qty_full = math.floor(current_qty / self.step) * self.step
-            if raw_qty_full > 0 and raw_qty_full * price >= min_order:
-                raw_qty = raw_qty_full
-            else:
-                self._log("系统", f"{self.symbol} 可卖数量 {raw_qty} 价值 {raw_qty * price:.2f} USDT 小于最小订单额，跳过卖出")
-                self._set_action("hold", f"最终可卖价值不足 {raw_qty * price:.2f} < {min_order:.2f}")
-                return False
+
         try:
             order_id = self.market_sell(raw_qty)
             if order_id is None:
                 self._record_trade_fail("卖出下单返回空order_id")
+                self._sell_fail_count += 1
+                if self._sell_fail_count >= self.MAX_SELL_FAIL:
+                    self._sell_fail_until = time.time() + self.SELL_FAIL_COOLDOWN
+                    self._sell_fail_count = 0
                 return False
+
             sold_value = raw_qty * price
             sell_fee = sold_value * self.slippage
             cost = avg_price * raw_qty
@@ -596,7 +783,8 @@ class ExpertBot(BaseBot):
                 highest_time=datetime.fromtimestamp(self.highest_time) if self.highest_time else None,
                 lowest_price=self.lowest_price,
                 lowest_time=datetime.fromtimestamp(self.lowest_time) if self.lowest_time else None,
-                add_records=self.add_records
+                add_records=self.add_records,
+                is_manual=False
             )
             self._after_sell(
                 pnl=pnl,
@@ -625,6 +813,14 @@ class ExpertBot(BaseBot):
                 else:
                     self.position["has_position"] = True
                     self._save_position_to_db()
+
+            # 通知策略切换器
+            self.strategy_switcher.update_after_trade({
+                "side": "sell",
+                "price": price,
+                "quantity": raw_qty
+            })
+
             if avg_price != 0:
                 is_win = pnl > 0
                 self.risk_manager.update_health(self.symbol, pnl, is_win)
@@ -635,7 +831,9 @@ class ExpertBot(BaseBot):
                         self._log("系统", f"{self.symbol} 连续亏损3次，暂停买入5分钟")
                 else:
                     self.consecutive_losses = 0
+
             self._reset_trade_fail()
+            self._sell_fail_count = 0
             if self.callback:
                 self.callback(self.key_id, self.symbol, "卖出", price, now)
             self._log("系统", f"{self.symbol} 卖出 @ {price:.6f}")
@@ -645,14 +843,29 @@ class ExpertBot(BaseBot):
         except Exception as e:
             self._log("系统", f"{self.symbol} 卖出失败: {e}")
             self._record_trade_fail(str(e))
+            self._sell_fail_count += 1
+            if self._sell_fail_count >= self.MAX_SELL_FAIL:
+                self._sell_fail_until = time.time() + self.SELL_FAIL_COOLDOWN
+                self._sell_fail_count = 0
             return False
 
     def _process_tick(self, price: float, now: float):
         self.sync_position_from_balance()
         self.update_kline(price, now)
         self._update_timeframe_klines()
+
+        # 更新市场状态分类
+        if len(self.kline_prices) >= 30:
+            self.strategy_switcher.update_market_state(
+                list(self.kline_highs)[-50:],
+                list(self.kline_lows)[-50:],
+                list(self.kline_prices)[-50:]
+            )
+            self.strategy_switcher.select_strategy()
+
         if len(self.kline_prices) < 50:
             return
+
         usdt, base_balance = self.get_balances()
         with self._position_lock:
             if self.position["has_position"] and price > self.position["highest_price"]:
@@ -666,6 +879,7 @@ class ExpertBot(BaseBot):
             if price < self.lowest_price or self.lowest_price == 0:
                 self.lowest_price = price
                 self.lowest_time = now
+
         atr_price = self._calculate_atr()
         rsi = self.indicators.rsi(list(self.kline_prices), 14) or 50
         volume_ratio = 1.0
@@ -675,58 +889,44 @@ class ExpertBot(BaseBot):
                 volume_ratio = self.volumes[-1] / avg_vol
         market_trend = self.timeframe_analyzer.get_higher_trend(self.symbol)
         hold_hours = (now - self.entry_time) / 3600 if self.entry_time else 0
-        score = self._calculate_buy_score()
-        threshold = self._get_dynamic_buy_threshold()
-        position_value = self._position_value(price)
+
         tradable_position = self._has_tradable_position(price)
         dust_position = self._has_dust_position(price)
-        if now - self.last_score_log_time >= 120:
-            self._log("系统", f"{self.symbol} 评分={score:.1f}, 阈值={threshold:.1f}", price)
-            self.last_score_log_time = now
+
+        # ========== 核心状态机 ==========
         if tradable_position:
-            should_sell, sell_orders = self._should_sell(
-                price, atr_price, rsi, volume_ratio, market_trend, hold_hours
-            )
+            should_sell, sell_orders = self._should_sell(price, atr_price, rsi, volume_ratio, market_trend, hold_hours, usdt)
             if should_sell:
                 if self._execute_sell(sell_orders, now):
                     return
-        if tradable_position:
-            if self._should_add_position(price, atr_price):
+
+        if tradable_position and time.time() >= self._add_fail_until:
+            if self._should_add_position(price, atr_price, usdt):
                 if self._execute_add_position(usdt, price, now):
                     return
-        if dust_position:
-            self._set_action("hold", f"残仓观察 {position_value:.2f}U，小于最小交易额，不卖不补")
-        if not self.position["has_position"] and self._should_buy(usdt, price):
-            self._execute_buy(usdt, price, now)
 
-        # 心跳日志：每20秒输出一次（修改间隔和内容）
+        if dust_position:
+            self._set_action("hold", f"残仓观察 {self._position_value(price):.2f}U，小于最小交易额，不卖不补")
+
+        if not self.position["has_position"] and time.time() >= self._sell_fail_until:
+            if self._should_buy(usdt, price):
+                self._execute_buy(usdt, price, now)
+
+        # 心跳和状态日志
         if now - self.last_heartbeat >= 20:
             self.last_heartbeat = now
             key_name = self._get_key_name()
-            self._log("系统", f"{key_name} {self.symbol} AI模式心跳检查")
+            self._log("系统", f"{key_name} {self.symbol} AI模式心跳检查, 市场状态={self.strategy_switcher.current_state}")
 
         if now - self.last_status_log >= 300:
             self.last_status_log = now
             health = self.risk_manager.get_health_score(self.symbol)
             if self.position["has_position"] and self.position["avg_price"]:
                 unrealized_pnl = (price - self.position["avg_price"]) * self.position["qty"]
-                self._log(
-                    "系统",
-                    f"{self.symbol} 状态: 持仓={self.position['qty']:.4f}, "
-                    f"持仓价值={position_value:.2f} USDT, "
-                    f"成本={self.position['avg_price']:.6f}, "
-                    f"浮动盈亏={unrealized_pnl:.2f} USDT, "
-                    f"健康度={health:.1f}, 阈值={threshold:.1f}, "
-                    f"最终动作={self.last_action}, 原因={self.last_action_reason}",
-                    price
-                )
+                self._log("系统", f"{self.symbol} 状态: 持仓={self.position['qty']:.4f}, 持仓价值={self._position_value(price):.2f} USDT, 成本={self.position['avg_price']:.6f}, 浮动盈亏={unrealized_pnl:.2f} USDT, 健康度={health:.1f}, 市场状态={self.strategy_switcher.current_state}, 最终动作={self.last_action}, 原因={self.last_action_reason}", price)
             else:
-                self._log(
-                    "系统",
-                    f"{self.symbol} 状态: 无持仓, 健康度={health:.1f}, 阈值={threshold:.1f}, "
-                    f"最终动作={self.last_action}, 原因={self.last_action_reason}",
-                    price
-                )
+                self._log("系统", f"{self.symbol} 状态: 无持仓, 健康度={health:.1f}, 市场状态={self.strategy_switcher.current_state}, 最终动作={self.last_action}, 原因={self.last_action_reason}", price)
+
         if self.callback:
             self.callback(self.key_id, self.symbol, "更新UI", price, now)
 

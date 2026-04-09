@@ -1,4 +1,8 @@
-# 文件路径: core/risk_manager.py
+# ============================================================
+# 文件: core/risk_manager.py
+# 说明: 风险管理器，管理健康度、动态参数存取
+# ============================================================
+
 from typing import Dict, Optional, Any
 from dao.coin_health_dao import CoinHealthDAO
 from dao.strategy_params_dao import StrategyParamsDAO
@@ -9,6 +13,7 @@ import json
 import logging
 
 logger = logging.getLogger(__name__)
+
 
 class RiskManager:
     def __init__(self, key_id: int, user_id: int, online_learner=None):
@@ -122,6 +127,19 @@ class RiskManager:
             self.symbol_params[symbol][param_name] = parsed
         logger.info(f"参数已更新: {param_name} for {symbol or 'global'} = {parsed}")
 
+        # 写入系统日志表
+        try:
+            from dao.system_log_dao import SystemLogDAO
+            SystemLogDAO.add(
+                user_id=self.user_id,
+                key_id=self.key_id,
+                level="INFO",
+                category="学习",
+                message=f"参数调整: {param_name} ({symbol or '全局'}) = {parsed}"
+            )
+        except Exception as e:
+            logger.error(f"写入系统日志失败: {e}")
+
     def get_position_ratio(self, symbol: str) -> float:
         base_ratio = self.get_param("position_ratio_base", symbol, 0.5)
         if isinstance(base_ratio, (list, dict)):
@@ -188,3 +206,15 @@ class RiskManager:
 
     def get_last_reason(self) -> str:
         return ""
+
+    def reset_symbol_health(self, symbol: str):
+        """重置指定币种的健康度为默认值60，并清除相关学习参数"""
+        self.health_cache[symbol] = 60.0
+        session = Session()
+        try:
+            CoinHealthDAO.upsert(self.key_id, symbol, 60.0, session)
+            session.commit()
+        finally:
+            session.close()
+        StrategyParamsDAO.delete_for_symbol(self.user_id, symbol, key_id=self.key_id)
+        logger.info(f"已重置 {symbol} 的健康度和学习参数")

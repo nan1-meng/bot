@@ -1,4 +1,8 @@
-# 文件路径: bots/base_bot.py
+# ============================================================
+# 文件: bots/base_bot.py
+# 说明: 机器人基类，提供通用持仓管理、余额获取、K线更新、交易执行
+# ============================================================
+
 import threading
 import time
 import math
@@ -10,6 +14,7 @@ import logging
 from dao.symbol_config_dao import SymbolConfigDAO
 
 logger = logging.getLogger(__name__)
+
 
 class BaseBot:
     def __init__(self, platform: str, api_key: str, secret_key: str, symbol: str, config: Dict[str, Any],
@@ -63,6 +68,14 @@ class BaseBot:
         self._stop_event = threading.Event()
         self._last_sync_time = 0
 
+        # 新增：补仓失败冷却
+        self._add_fail_until = 0
+        # 新增：卖出失败冷却（针对残仓无法卖出）
+        self._sell_fail_until = 0
+        self._sell_fail_count = 0
+        self.MAX_SELL_FAIL = 3
+        self.SELL_FAIL_COOLDOWN = 300  # 5分钟
+
         if "资深" in mode_display and auto_warmup:
             self._warmup_kline()
 
@@ -112,7 +125,8 @@ class BaseBot:
                     'price': price or self.get_current_price(),
                     'quantity': quantity or 0,
                     'hold_seconds': hold_seconds,
-                    'entry_score': entry_score
+                    'entry_score': entry_score,
+                    'is_manual': False
                 }
                 TradeObj = namedtuple('TradeObj', trade_data.keys())
                 trade = TradeObj(**trade_data)
@@ -128,8 +142,12 @@ class BaseBot:
             if config and config.quantity is not None and config.quantity > 0 and config.avg_price is not None:
                 _, base = self.get_balances()
                 db_qty = float(config.quantity)
-                if abs(db_qty - base) > 0.0001:
+                # 对账：若数据库数量与交易所实际持仓相差超过1%，可能发生了手动交易，重置学习数据
+                if abs(db_qty - base) > max(0.0001, base * 0.01):
+                    self._log("系统", f"检测到持仓与数据库记录不符 (DB:{db_qty:.4f}, 实际:{base:.4f})，可能发生手动交易，重置学习状态")
                     self._clear_position_in_db()
+                    if self.risk_manager:
+                        self.risk_manager.reset_symbol_health(self.symbol)
                     return False
                 with self._position_lock:
                     self.position["has_position"] = True
@@ -167,6 +185,9 @@ class BaseBot:
             return None
 
     def market_buy(self, amount_usdt: float) -> Optional[str]:
+        if amount_usdt < 5.0:
+            self._log("系统", f"买入金额 {amount_usdt:.2f} USDT 低于最小限额 5 USDT")
+            return None
         if not self.risk_manager.can_buy(self.symbol, amount_usdt):
             self._log("风控", f"买入被拒绝：{self.risk_manager.get_last_reason()}")
             return None
@@ -247,7 +268,6 @@ class BaseBot:
                             self.position["entry_time"] = time.time()
                             self.position["highest_price"] = price
                             self._save_position_to_db()
-                            # 不再输出“检测到已有持仓...从交易所加载成本价”日志
                         else:
                             self.position["has_position"] = True
                             self.position["qty"] = base

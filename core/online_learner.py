@@ -1,4 +1,8 @@
-# 文件路径: core/online_learner.py
+# ============================================================
+# 文件: core/online_learner.py
+# 说明: 在线学习器，自动分析亏损交易并调整风险参数
+# ============================================================
+
 import threading
 import time
 import json
@@ -13,6 +17,7 @@ from core.learning_reporter import LearningReporter
 import logging
 
 logger = logging.getLogger(__name__)
+
 
 class OnlineLearner:
     def __init__(self, user_id: int, risk_manager, analysis_interval: int = 3600):
@@ -164,14 +169,14 @@ class OnlineLearner:
         session = Session()
         try:
             cutoff = datetime.now() - timedelta(days=7)
-            # 使用 executed_at 而不是 timestamp
             trades = session.query(Trade).filter(
                 Trade.user_id == self.user_id,
                 Trade.side == 'sell',
-                Trade.executed_at >= cutoff
+                Trade.executed_at >= cutoff,
+                Trade.is_manual == False
             ).all()
             if not trades:
-                logger.info(f"用户 {self.user_id} 无近期交易，跳过学习")
+                logger.info(f"用户 {self.user_id} 无近期机器人交易，跳过学习")
                 return
 
             total_trades = len(trades)
@@ -229,6 +234,20 @@ class OnlineLearner:
                             if new_th != current_th:
                                 self.risk_manager.set_param("buy_threshold_base", new_th, cfg.symbol)
                                 logger.info(f"币种 {cfg.symbol} 健康度 {health} 且 {days_since} 天无交易，强制降低阈值至 {new_th}")
+
+            # 写入汇总日志
+            logger.info(f"在线学习分析完成，用户 {self.user_id}")
+            try:
+                from dao.system_log_dao import SystemLogDAO
+                SystemLogDAO.add(
+                    user_id=self.user_id,
+                    key_id=self.risk_manager.key_id,
+                    level="INFO",
+                    category="学习",
+                    message=f"在线学习完成: 分析交易{total_trades}笔, 胜率{win_rate:.1%}, 已调整参数"
+                )
+            except Exception as e:
+                logger.error(f"写入系统日志失败: {e}")
 
         except Exception as e:
             logger.error(f"在线学习分析失败: {e}")
